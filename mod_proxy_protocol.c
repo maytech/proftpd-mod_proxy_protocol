@@ -47,6 +47,7 @@ static int proxy_protocol_timeout = PROXY_PROTOCOL_TIMEOUT_DEFAULT;
 #define PROXY_PROTOCOL_VERSION_HAPROXY_V1	1
 #define PROXY_PROTOCOL_VERSION_HAPROXY_V2	2
 static unsigned int proxy_protocol_version = PROXY_PROTOCOL_VERSION_HAPROXY_V1;
+static int proxy_protocol_local_address = FALSE;
 
 static const char *trace_channel = "proxy_protocol";
 
@@ -305,7 +306,8 @@ static unsigned int strtou(const char **str, const char *last) {
  *  - DST4:  layer 4 (e.g. TCP port) destination address in standard text form
  */
 static int read_haproxy_v1(pool *p, conn_t *conn,
-    const pr_netaddr_t **proxied_addr, unsigned int *proxied_port) {
+    const pr_netaddr_t **proxied_addr, unsigned int *proxied_port,
+    const pr_netaddr_t **local_addr, unsigned int *local_port) {
   register unsigned int i;
   char buf[PROXY_PROTOCOL_BUFSZ], *last = NULL, *ptr = NULL;
   int have_cr = FALSE, have_nl = FALSE, have_tcp4 = FALSE, have_tcp6 = FALSE;
@@ -469,7 +471,7 @@ static int read_haproxy_v1(pool *p, conn_t *conn,
      * check for this, scan the given address fields for illegal (e.g.
      * alphabetic) characters, keeping in mind that IPv6 addresses can use
      * hex.
-     */ 
+     */
 
     if (have_tcp4) {
       if (pr_netaddr_get_family(src_addr) != AF_INET) {
@@ -591,6 +593,9 @@ static int read_haproxy_v1(pool *p, conn_t *conn,
     *proxied_addr = src_addr;
     *proxied_port = src_port;
 
+    *local_addr = dst_addr;
+    *local_port = dst_port;
+
   } else if (strncmp(ptr, "UNKNOWN", 7) == 0) {
     pr_log_debug(DEBUG5, MOD_PROXY_PROTOCOL_VERSION
       ": client cannot provide proxied address: '%.100s'", buf);
@@ -602,7 +607,7 @@ static int read_haproxy_v1(pool *p, conn_t *conn,
       ": unknown/unsupported PROTO field");
     goto bad_proto;
   }
- 
+
   return 1;
 
 bad_proto:
@@ -617,7 +622,8 @@ bad_proto:
 static const char haproxy_v2_sig[12] = "\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A";
 
 static int read_haproxy_v2(pool *p, conn_t *conn,
-    const pr_netaddr_t **proxied_addr, unsigned int *proxied_port) {
+    const pr_netaddr_t **proxied_addr, unsigned int *proxied_port,
+    const pr_netaddr_t **local_addr, unsigned int *local_port) {
   int res = 0;
   uint8_t v2_sig[12], ver_cmd, trans_fam;
   uint16_t v2_len;
@@ -911,22 +917,26 @@ static int read_haproxy_v2(pool *p, conn_t *conn,
   *proxied_addr = src_addr;
   *proxied_port = ntohs(pr_netaddr_get_port(src_addr));
 
+  *local_addr = dst_addr;
+  *local_port = ntohs(pr_netaddr_get_port(dst_addr));
+
   return 0;
 }
 
 static int read_proxied_addr(pool *p, conn_t *conn,
-   const pr_netaddr_t **proxied_addr, unsigned int *proxied_port) {
+   const pr_netaddr_t **proxied_addr, unsigned int *proxied_port,
+   const pr_netaddr_t **local_addr, unsigned int *local_port) {
   int res;
 
   /* Note that in theory, we could auto-detect the protocol version. */
 
   switch (proxy_protocol_version) {
     case PROXY_PROTOCOL_VERSION_HAPROXY_V1:
-      res = read_haproxy_v1(p, conn, proxied_addr, proxied_port);
+      res = read_haproxy_v1(p, conn, proxied_addr, proxied_port, local_addr, local_port);
       break;
 
     case PROXY_PROTOCOL_VERSION_HAPROXY_V2:
-      res = read_haproxy_v2(p, conn, proxied_addr, proxied_port);
+      res = read_haproxy_v2(p, conn, proxied_addr, proxied_port, local_addr, local_port);
       break;
 
     default:
@@ -964,7 +974,7 @@ MODRET set_proxyprotocolengine(cmd_rec *cmd) {
   if (engine == -1) {
     CONF_ERROR(cmd, "expected Boolean parameter");
   }
- 
+
   c = add_config_param(cmd->argv[0], 1, NULL);
   c->argv[0] = pcalloc(c->pool, sizeof(int));
   *((int *) c->argv[0]) = engine;
@@ -1018,15 +1028,35 @@ MODRET set_proxyprotocolversion(cmd_rec *cmd) {
   return PR_HANDLED(cmd);
 }
 
+/* usage: ProxyProtocolLocalAddress on|off */
+MODRET set_proxyprotocollocaladdress(cmd_rec *cmd) {
+    int local_address = 0;
+    config_rec *c;
+
+    CHECK_ARGS(cmd, 1);
+    CHECK_CONF(cmd, CONF_ROOT|CONF_VIRTUAL|CONF_GLOBAL);
+
+    local_address = get_boolean(cmd, 1);
+    if (local_address == -1) {
+        CONF_ERROR(cmd, "expected Boolean parameter");
+    }
+
+    c = add_config_param(cmd->argv[0], 1, NULL);
+    c->argv[0] = pcalloc(c->pool, sizeof(int));
+    *((int *) c->argv[0]) = local_address;
+
+    return PR_HANDLED(cmd);
+}
+
 /* Initialization routines
  */
 
 static int proxy_protocol_sess_init(void) {
   config_rec *c;
   int engine = 0, res = 0, timerno = -1, xerrno;
-  const pr_netaddr_t *proxied_addr = NULL;
-  unsigned int proxied_port = 0;
-  const char *remote_ip = NULL, *remote_name = NULL;
+  const pr_netaddr_t *proxied_addr = NULL, *local_addr = NULL;
+  unsigned int proxied_port = 0, local_port = 0;
+  const char *remote_ip = NULL, *remote_name = NULL, *local_ip = NULL;
   pr_netio_t *tls_netio = NULL;
 
   c = find_config(main_server->conf, CONF_PARAM, "ProxyProtocolEngine", FALSE);
@@ -1046,6 +1076,11 @@ static int proxy_protocol_sess_init(void) {
   c = find_config(main_server->conf, CONF_PARAM, "ProxyProtocolVersion", FALSE);
   if (c != NULL) {
     proxy_protocol_version = *((int *) c->argv[0]);
+  }
+
+  c = find_config(main_server->conf, CONF_PARAM, "ProxyProtocolLocalAddress", FALSE);
+  if (c != NULL) {
+    proxy_protocol_local_address = *((int *) c->argv[0]);
   }
 
   if (proxy_protocol_timeout > 0) {
@@ -1073,7 +1108,7 @@ static int proxy_protocol_sess_init(void) {
   }
 
   res = read_proxied_addr(session.pool, session.c, &proxied_addr,
-    &proxied_port);
+    &proxied_port, &local_addr, &local_port);
   xerrno = errno;
 
   if (tls_netio != NULL) {
@@ -1107,6 +1142,16 @@ static int proxy_protocol_sess_init(void) {
     session.c->remote_addr = proxied_addr;
     session.c->remote_port = proxied_port;
 
+    if (proxy_protocol_local_address) {
+      local_ip = pstrdup(session.pool,
+        pr_netaddr_get_ipstr(pr_netaddr_get_sess_local_addr()));
+
+      pr_log_debug(DEBUG9, MOD_PROXY_PROTOCOL_VERSION
+        ": using proxied destination address: %s", pr_netaddr_get_ipstr(local_addr));
+      session.c->local_addr = local_addr;
+      session.c->local_port = local_port;
+    }
+
     /* Now perform reverse DNS lookups. */
     if (ServerUseReverseDNS) {
       int reverse_dns;
@@ -1127,6 +1172,12 @@ static int proxy_protocol_sess_init(void) {
       pr_netaddr_get_ipstr(pr_netaddr_get_sess_remote_addr()),
       pr_netaddr_get_sess_remote_name(), remote_ip, remote_name);
 
+    if (proxy_protocol_local_address) {
+      pr_log_debug(DEBUG0, MOD_PROXY_PROTOCOL_VERSION
+        ": UPDATED destination server address: %s (WAS %s)",
+        pr_netaddr_get_ipstr(pr_netaddr_get_sess_local_addr()),
+        local_ip);
+    }
     /* Find the new class for this session. */
     session.conn_class = pr_class_match_addr(session.c->remote_addr);
     if (session.conn_class != NULL) {
@@ -1139,7 +1190,7 @@ static int proxy_protocol_sess_init(void) {
         ": session requested from proxied client in unknown class");
     }
   }
- 
+
   return 0;
 }
 
@@ -1150,6 +1201,7 @@ static conftable proxy_protocol_conftab[] = {
   { "ProxyProtocolEngine",	set_proxyprotocolengine,	NULL },
   { "ProxyProtocolTimeout",	set_proxyprotocoltimeout,	NULL },
   { "ProxyProtocolVersion",	set_proxyprotocolversion,	NULL },
+  { "ProxyProtocolLocalAddress",	set_proxyprotocollocaladdress,	NULL },
 
   { NULL }
 };
@@ -1182,4 +1234,3 @@ module proxy_protocol_module = {
   /* Module version */
   MOD_PROXY_PROTOCOL_VERSION
 };
-
