@@ -1058,6 +1058,7 @@ static int proxy_protocol_sess_init(void) {
   unsigned int proxied_port = 0, local_port = 0;
   const char *remote_ip = NULL, *remote_name = NULL, *local_ip = NULL;
   pr_netio_t *tls_netio = NULL;
+  server_rec *new_main_server = NULL;
 
   c = find_config(main_server->conf, CONF_PARAM, "ProxyProtocolEngine", FALSE);
   if (c != NULL) {
@@ -1150,6 +1151,11 @@ static int proxy_protocol_sess_init(void) {
         ": using proxied destination address: %s", pr_netaddr_get_ipstr(local_addr));
       session.c->local_addr = local_addr;
       session.c->local_port = local_port;
+      /* Redefine the server for this connection. */
+      new_main_server = pr_ipbind_get_server(session.c->local_addr, session.c->local_port);
+      if (new_main_server) {
+          main_server = new_main_server;
+      }
     }
 
     /* Now perform reverse DNS lookups. */
