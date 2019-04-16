@@ -41,12 +41,13 @@ module proxy_protocol_module;
 
 #define PROXY_PROTOCOL_BUFSZ			128
 
-#define PROXY_PROTOCOL_TIMEOUT_DEFAULT		3
+#define PROXY_PROTOCOL_TIMEOUT_DEFAULT		1
 static int proxy_protocol_timeout = PROXY_PROTOCOL_TIMEOUT_DEFAULT;
 
 #define PROXY_PROTOCOL_VERSION_HAPROXY_V1	1
 #define PROXY_PROTOCOL_VERSION_HAPROXY_V2	2
 static unsigned int proxy_protocol_version = PROXY_PROTOCOL_VERSION_HAPROXY_V1;
+static int proxy_protocol_engine = FALSE;
 static int proxy_protocol_local_address = FALSE;
 
 static const char *trace_channel = "proxy_protocol";
