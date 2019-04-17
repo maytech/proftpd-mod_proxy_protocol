@@ -1171,16 +1171,16 @@ static int proxy_protocol_sess_init(void) {
   const char *remote_ip = NULL, *remote_name = NULL, *local_ip = NULL;
   pr_netio_t *tls_netio = NULL;
 
+  if (proxy_protocol_local_address == TRUE) {
+      return 0;
+  }
+
   c = find_config(main_server->conf, CONF_PARAM, "ProxyProtocolEngine", FALSE);
   if (c != NULL) {
     engine = *((int *) c->argv[0]);
   }
 
   if (engine == FALSE) {
-    return 0;
-  }
-
-  if (proxy_protocol_local_address == TRUE) {
     return 0;
   }
 
@@ -1273,12 +1273,6 @@ static int proxy_protocol_sess_init(void) {
       pr_netaddr_get_ipstr(pr_netaddr_get_sess_remote_addr()),
       pr_netaddr_get_sess_remote_name(), remote_ip, remote_name);
 
-    if (proxy_protocol_local_address) {
-      pr_log_debug(DEBUG0, MOD_PROXY_PROTOCOL_VERSION
-        ": UPDATED destination server address: %s (WAS %s)",
-        pr_netaddr_get_ipstr(pr_netaddr_get_sess_local_addr()),
-        local_ip);
-    }
     /* Find the new class for this session. */
     session.conn_class = pr_class_match_addr(session.c->remote_addr);
     if (session.conn_class != NULL) {
