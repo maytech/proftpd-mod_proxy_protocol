@@ -1138,7 +1138,7 @@ static void proxy_protocol_connect_ev(const void *event_data, void *user_data) {
 
 /* Initialization routines
  */
-static void proxy_protocol_postparse_ev(const void *event_data, void *user_data) {
+static void proxy_protocol_startup_ev(const void *event_data, void *user_data) {
     pr_event_register(&proxy_protocol_module, "core.connect", proxy_protocol_connect_ev,
                       NULL);
 }
@@ -1157,7 +1157,7 @@ static int proxy_protocol_init(void) {
                       proxy_protocol_mod_unload_ev, NULL);
 #endif /* PR_SHARED_MODULE */
 
-    pr_event_register(&proxy_protocol_module, "core.postparse", proxy_protocol_postparse_ev,
+    pr_event_register(&proxy_protocol_module, "core.startup", proxy_protocol_startup_ev,
                       NULL);
 
     return 0;
