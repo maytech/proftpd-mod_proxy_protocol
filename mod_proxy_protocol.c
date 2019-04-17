@@ -1170,7 +1170,6 @@ static int proxy_protocol_sess_init(void) {
   unsigned int proxied_port = 0, local_port = 0;
   const char *remote_ip = NULL, *remote_name = NULL, *local_ip = NULL;
   pr_netio_t *tls_netio = NULL;
-  server_rec *new_main_server = NULL;
 
   c = find_config(main_server->conf, CONF_PARAM, "ProxyProtocolEngine", FALSE);
   if (c != NULL) {
