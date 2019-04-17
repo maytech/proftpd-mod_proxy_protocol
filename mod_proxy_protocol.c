@@ -1065,7 +1065,7 @@ MODRET set_proxyprotocollocaladdress(cmd_rec *cmd) {
 
 static void proxy_protocol_connect_ev(const void *event_data, void *user_data) {
     conn_t *conn = (conn_t *) event_data;
-    int engine = 0, res = 0, timerno = -1, xerrno;
+    int res = 0, timerno = -1, xerrno;
     const pr_netaddr_t *proxied_addr = NULL, *local_addr = NULL;
     unsigned int proxied_port = 0, local_port = 0;
     pr_netio_t *tls_netio = NULL;
