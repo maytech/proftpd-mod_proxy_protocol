@@ -1063,29 +1063,6 @@ MODRET set_proxyprotocollocaladdress(cmd_rec *cmd) {
     return PR_HANDLED(cmd);
 }
 
-/* Initialization routines
- */
-static int proxy_protocol_init(void) {
-#if defined(PR_SHARED_MODULE)
-    pr_event_register(&proxy_protocol_module, "core.module-unload",
-                      proxy_protocol_mod_unload_ev, NULL);
-#endif /* PR_SHARED_MODULE */
-
-    pr_event_register(&proxy_protocol_module, "core.connect", proxy_protocol_connect_ev,
-                      NULL);
-
-    return 0;
-}
-
-#if defined(PR_SHARED_MODULE)
-static void proxy_protocol_mod_unload_ev(const void *event_data, void *user_data) {
-    if (strcmp("mod_proxy_protocol.c", (const char *) event_data) == 0) {
-        pr_event_unregister(&proxy_protocol_module, NULL, NULL);
-    }
-}
-#endif
-
-
 static void proxy_protocol_connect_ev(const void *event_data, void *user_data) {
     conn_t *conn = (conn_t *) event_data;
     int engine = 0, res = 0, timerno = -1, xerrno;
@@ -1125,7 +1102,7 @@ static void proxy_protocol_connect_ev(const void *event_data, void *user_data) {
     pr_unregister_netio(PR_NETIO_STRM_CTRL);
   }
 
-  res = read_proxied_addr(conn.pool, conn, &proxied_addr,
+  res = read_proxied_addr(conn->pool, conn, &proxied_addr,
     &proxied_port, &local_addr, &local_port);
   xerrno = errno;
 
@@ -1157,6 +1134,28 @@ static void proxy_protocol_connect_ev(const void *event_data, void *user_data) {
       conn->local_addr = local_addr;
       conn->local_port = local_port;
   }
+}
+
+/* Initialization routines
+ */
+#if defined(PR_SHARED_MODULE)
+static void proxy_protocol_mod_unload_ev(const void *event_data, void *user_data) {
+    if (strcmp("mod_proxy_protocol.c", (const char *) event_data) == 0) {
+        pr_event_unregister(&proxy_protocol_module, NULL, NULL);
+    }
+}
+#endif
+
+static int proxy_protocol_init(void) {
+#if defined(PR_SHARED_MODULE)
+    pr_event_register(&proxy_protocol_module, "core.module-unload",
+                      proxy_protocol_mod_unload_ev, NULL);
+#endif /* PR_SHARED_MODULE */
+
+    pr_event_register(&proxy_protocol_module, "core.connect", proxy_protocol_connect_ev,
+                      NULL);
+
+    return 0;
 }
 
 static int proxy_protocol_sess_init(void) {
