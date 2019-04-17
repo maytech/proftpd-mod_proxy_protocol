@@ -94,7 +94,7 @@ static int poll_sock(int sockfd) {
       pr_trace_msg(trace_channel, 18,
         "polling on socket %d timed out after %lu sec, trying again", sockfd,
         (unsigned long) tv.tv_sec);
-      continue;
+      return 0;
     }
 
     break;
