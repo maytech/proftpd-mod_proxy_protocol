@@ -1065,6 +1065,26 @@ MODRET set_proxyprotocollocaladdress(cmd_rec *cmd) {
 
 /* Initialization routines
  */
+static int proxy_protocol_init(void) {
+#if defined(PR_SHARED_MODULE)
+    pr_event_register(&proxy_protocol_module, "core.module-unload",
+                      proxy_protocol_mod_unload_ev, NULL);
+#endif /* PR_SHARED_MODULE */
+
+    pr_event_register(&proxy_protocol_module, "core.connect", proxy_protocol_connect_ev,
+                      NULL);
+
+    return 0;
+}
+
+#if defined(PR_SHARED_MODULE)
+static void proxy_protocol_mod_unload_ev(const void *event_data, void *user_data) {
+    if (strcmp("mod_proxy_protocol.c", (const char *) event_data) == 0) {
+        pr_event_unregister(&proxy_protocol_module, NULL, NULL);
+    }
+}
+#endif
+
 
 static void proxy_protocol_connect_ev(const void *event_data, void *user_data) {
     conn_t *conn = (conn_t *) event_data;
@@ -1304,7 +1324,7 @@ module proxy_protocol_module = {
   NULL,
 
   /* Module initialization */
-  NULL,
+  proxy_protocol_init,
 
   /* Session initialization */
   proxy_protocol_sess_init,
