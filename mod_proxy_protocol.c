@@ -30,7 +30,7 @@
 # include <sys/uio.h>
 #endif /* HAVE_SYS_UIO_H */
 
-#define MOD_PROXY_PROTOCOL_VERSION	"mod_proxy_protocol/0.1"
+#define MOD_PROXY_PROTOCOL_VERSION	"mod_proxy_protocol/0.2"
 
 /* Make sure the version of proftpd is as necessary. */
 #if PROFTPD_VERSION_NUMBER < 0x0001030504
@@ -980,6 +980,10 @@ MODRET set_proxyprotocolengine(cmd_rec *cmd) {
   c->argv[0] = pcalloc(c->pool, sizeof(int));
   *((int *) c->argv[0]) = engine;
 
+  if (check_context(cmd, CONF_ROOT)) {
+      proxy_protocol_engine = engine;
+  }
+
   return PR_HANDLED(cmd);
 }
 
@@ -999,6 +1003,10 @@ MODRET set_proxyprotocoltimeout(cmd_rec *cmd) {
   c = add_config_param(cmd->argv[0], 1, NULL);
   c->argv[0] = pcalloc(c->pool, sizeof(int));
   *((int *) c->argv[0]) = timeout;
+
+  if (check_context(cmd, CONF_ROOT)) {
+      proxy_protocol_timeout = timeout;
+  }
 
   return PR_HANDLED(cmd);
 }
@@ -1026,6 +1034,10 @@ MODRET set_proxyprotocolversion(cmd_rec *cmd) {
   c->argv[0] = pcalloc(c->pool, sizeof(int));
   *((int *) c->argv[0]) = proto_version;
 
+  if (check_context(cmd, CONF_ROOT)) {
+      proxy_protocol_version = proto_version;
+  }
+
   return PR_HANDLED(cmd);
 }
 
@@ -1035,7 +1047,7 @@ MODRET set_proxyprotocollocaladdress(cmd_rec *cmd) {
     config_rec *c;
 
     CHECK_ARGS(cmd, 1);
-    CHECK_CONF(cmd, CONF_ROOT|CONF_VIRTUAL|CONF_GLOBAL);
+    CHECK_CONF(cmd, CONF_ROOT);
 
     local_address = get_boolean(cmd, 1);
     if (local_address == -1) {
@@ -1046,11 +1058,86 @@ MODRET set_proxyprotocollocaladdress(cmd_rec *cmd) {
     c->argv[0] = pcalloc(c->pool, sizeof(int));
     *((int *) c->argv[0]) = local_address;
 
+    proxy_protocol_local_address = local_address;
+
     return PR_HANDLED(cmd);
 }
 
 /* Initialization routines
  */
+
+static void proxy_protocol_connect_ev(const void *event_data, void *user_data) {
+    conn_t *conn = (conn_t *) event_data;
+    int engine = 0, res = 0, timerno = -1, xerrno;
+    const pr_netaddr_t *proxied_addr = NULL, *local_addr = NULL;
+    unsigned int proxied_port = 0, local_port = 0;
+    pr_netio_t *tls_netio = NULL;
+
+    if (proxy_protocol_engine == FALSE) {
+        return;
+    }
+
+    if (proxy_protocol_local_address == FALSE) {
+        return;
+    }
+
+  if (proxy_protocol_timeout > 0) {
+    timerno = pr_timer_add(proxy_protocol_timeout, -1,
+      &proxy_protocol_module, proxy_protocol_timeout_cb,
+      "ProxyProtocolTimeout");
+  }
+
+  /* If the mod_tls module is in effect, then we need to work around its
+   * use of the NetIO API.  Otherwise, trying to read the proxied address
+   * on the control connection will cause problems, e.g. for FTPS clients
+   * using implicit TLS.
+   */
+  tls_netio = pr_get_netio(PR_NETIO_STRM_CTRL);
+  if (tls_netio == NULL ||
+      tls_netio->owner_name == NULL ||
+      strncmp(tls_netio->owner_name, "tls", 4) != 0) {
+
+    /* Not a mod_tls netio; ignore it. */
+    tls_netio = NULL;
+
+  } else {
+    /* Unregister it; we'll put it back after reading the proxied address. */
+    pr_unregister_netio(PR_NETIO_STRM_CTRL);
+  }
+
+  res = read_proxied_addr(conn.pool, conn, &proxied_addr,
+    &proxied_port, &local_addr, &local_port);
+  xerrno = errno;
+
+  if (tls_netio != NULL) {
+    if (pr_register_netio(tls_netio, PR_NETIO_STRM_CTRL) < 0) {
+      pr_log_debug(DEBUG1, MOD_PROXY_PROTOCOL_VERSION
+        ": unable to re-register TLS control NetIO: %s", strerror(errno));
+    }
+  }
+
+  if (proxy_protocol_timeout > 0) {
+    pr_timer_remove(timerno, &proxy_protocol_module);
+  }
+
+  if (res < 0) {
+    pr_log_debug(DEBUG0, MOD_PROXY_PROTOCOL_VERSION
+      ": error reading proxy info: %s", strerror(xerrno));
+
+    errno = EPERM;
+    return;
+  }
+
+  if (proxied_addr != NULL) {
+    conn->remote_addr = proxied_addr;
+    conn->remote_port = proxied_port;
+  }
+
+  if (local_addr != NULL) {
+      conn->local_addr = local_addr;
+      conn->local_port = local_port;
+  }
+}
 
 static int proxy_protocol_sess_init(void) {
   config_rec *c;
@@ -1070,6 +1157,10 @@ static int proxy_protocol_sess_init(void) {
     return 0;
   }
 
+  if (proxy_protocol_local_address == TRUE) {
+    return 0;
+  }
+
   c = find_config(main_server->conf, CONF_PARAM, "ProxyProtocolTimeout", FALSE);
   if (c != NULL) {
     proxy_protocol_timeout = *((int *) c->argv[0]);
@@ -1078,11 +1169,6 @@ static int proxy_protocol_sess_init(void) {
   c = find_config(main_server->conf, CONF_PARAM, "ProxyProtocolVersion", FALSE);
   if (c != NULL) {
     proxy_protocol_version = *((int *) c->argv[0]);
-  }
-
-  c = find_config(main_server->conf, CONF_PARAM, "ProxyProtocolLocalAddress", FALSE);
-  if (c != NULL) {
-    proxy_protocol_local_address = *((int *) c->argv[0]);
   }
 
   if (proxy_protocol_timeout > 0) {
@@ -1143,21 +1229,6 @@ static int proxy_protocol_sess_init(void) {
 
     session.c->remote_addr = proxied_addr;
     session.c->remote_port = proxied_port;
-
-    if (proxy_protocol_local_address) {
-      local_ip = pstrdup(session.pool,
-        pr_netaddr_get_ipstr(pr_netaddr_get_sess_local_addr()));
-
-      pr_log_debug(DEBUG9, MOD_PROXY_PROTOCOL_VERSION
-        ": using proxied destination address: %s", pr_netaddr_get_ipstr(local_addr));
-      session.c->local_addr = local_addr;
-      session.c->local_port = local_port;
-      /* Redefine the server for this connection. */
-      new_main_server = pr_ipbind_get_server(session.c->local_addr, session.c->local_port);
-      if (new_main_server) {
-          main_server = new_main_server;
-      }
-    }
 
     /* Now perform reverse DNS lookups. */
     if (ServerUseReverseDNS) {
