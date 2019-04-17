@@ -1078,12 +1078,6 @@ static void proxy_protocol_connect_ev(const void *event_data, void *user_data) {
         return;
     }
 
-  if (proxy_protocol_timeout > 0) {
-    timerno = pr_timer_add(proxy_protocol_timeout, -1,
-      &proxy_protocol_module, proxy_protocol_timeout_cb,
-      "ProxyProtocolTimeout");
-  }
-
   /* If the mod_tls module is in effect, then we need to work around its
    * use of the NetIO API.  Otherwise, trying to read the proxied address
    * on the control connection will cause problems, e.g. for FTPS clients
@@ -1111,10 +1105,6 @@ static void proxy_protocol_connect_ev(const void *event_data, void *user_data) {
       pr_log_debug(DEBUG1, MOD_PROXY_PROTOCOL_VERSION
         ": unable to re-register TLS control NetIO: %s", strerror(errno));
     }
-  }
-
-  if (proxy_protocol_timeout > 0) {
-    pr_timer_remove(timerno, &proxy_protocol_module);
   }
 
   if (res < 0) {
