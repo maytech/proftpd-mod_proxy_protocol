@@ -1146,7 +1146,7 @@ static int proxy_protocol_init(void) {
     pr_event_register(&proxy_protocol_module, "core.module-unload",
                       proxy_protocol_mod_unload_ev, NULL);
 #endif /* PR_SHARED_MODULE */
-
+    timers_init();
     pr_event_register(&proxy_protocol_module, "core.startup", proxy_protocol_startup_ev,
                       NULL);
 
