@@ -46,6 +46,8 @@ static int proxy_protocol_timeout = PROXY_PROTOCOL_TIMEOUT_DEFAULT;
 
 #define PROXY_PROTOCOL_VERSION_HAPROXY_V1	1
 #define PROXY_PROTOCOL_VERSION_HAPROXY_V2	2
+#define PROXY_PROTOCOL_LOCAL_ADDRESS_NOTE_NAME "mod_proxy_protocol.local_address"
+#define PROXY_PROTOCOL_LOCAL_PORT_NOTE_NAME    "mod_proxy_protocol.local_port"
 static unsigned int proxy_protocol_version = PROXY_PROTOCOL_VERSION_HAPROXY_V1;
 static int proxy_protocol_engine = FALSE;
 static int proxy_protocol_local_address = FALSE;
@@ -593,6 +595,9 @@ static int read_haproxy_v1(pool *p, conn_t *conn,
 
     *proxied_addr = src_addr;
     *proxied_port = src_port;
+
+    /* Set the local port for the local address. */
+    pr_netaddr_set_port((pr_netaddr_t *) dst_addr, htons(dst_port));
 
     *local_addr = dst_addr;
     *local_port = dst_port;
@@ -1380,6 +1385,79 @@ static int proxy_protocol_init(void) {
     return 0;
 }
 
+static void proxy_protocol_connect_ev(const void *event_data, void *user_data) {
+    conn_t *conn = (conn_t *) event_data;
+    int engine = 0, res = 0, timerno = -1, xerrno;
+    const pr_netaddr_t *proxied_addr = NULL, *local_addr = NULL;
+    unsigned int proxied_port = 0, local_port = 0;
+    pr_netio_t *tls_netio = NULL;
+
+    if (proxy_protocol_engine == FALSE) {
+        return;
+    }
+
+    if (proxy_protocol_local_address == FALSE) {
+        return;
+    }
+
+  if (proxy_protocol_timeout > 0) {
+    timerno = pr_timer_add(proxy_protocol_timeout, -1,
+      &proxy_protocol_module, proxy_protocol_timeout_cb,
+      "ProxyProtocolTimeout");
+  }
+
+  /* If the mod_tls module is in effect, then we need to work around its
+   * use of the NetIO API.  Otherwise, trying to read the proxied address
+   * on the control connection will cause problems, e.g. for FTPS clients
+   * using implicit TLS.
+   */
+  tls_netio = pr_get_netio(PR_NETIO_STRM_CTRL);
+  if (tls_netio == NULL ||
+      tls_netio->owner_name == NULL ||
+      strncmp(tls_netio->owner_name, "tls", 4) != 0) {
+
+    /* Not a mod_tls netio; ignore it. */
+    tls_netio = NULL;
+
+  } else {
+    /* Unregister it; we'll put it back after reading the proxied address. */
+    pr_unregister_netio(PR_NETIO_STRM_CTRL);
+  }
+
+  res = read_proxied_addr(conn.pool, conn, &proxied_addr,
+    &proxied_port, &local_addr, &local_port);
+  xerrno = errno;
+
+  if (tls_netio != NULL) {
+    if (pr_register_netio(tls_netio, PR_NETIO_STRM_CTRL) < 0) {
+      pr_log_debug(DEBUG1, MOD_PROXY_PROTOCOL_VERSION
+        ": unable to re-register TLS control NetIO: %s", strerror(errno));
+    }
+  }
+
+  if (proxy_protocol_timeout > 0) {
+    pr_timer_remove(timerno, &proxy_protocol_module);
+  }
+
+  if (res < 0) {
+    pr_log_debug(DEBUG0, MOD_PROXY_PROTOCOL_VERSION
+      ": error reading proxy info: %s", strerror(xerrno));
+
+    errno = EPERM;
+    return;
+  }
+
+  if (proxied_addr != NULL) {
+    conn->remote_addr = proxied_addr;
+    conn->remote_port = proxied_port;
+  }
+
+  if (local_addr != NULL) {
+      conn->local_addr = local_addr;
+      conn->local_port = local_port;
+  }
+}
+
 static int proxy_protocol_sess_init(void) {
   config_rec *c;
   int engine = 0, res = 0, timerno = -1, xerrno;
@@ -1398,6 +1476,10 @@ static int proxy_protocol_sess_init(void) {
   }
 
   if (engine == FALSE) {
+    return 0;
+  }
+
+  if (proxy_protocol_local_address == TRUE) {
     return 0;
   }
 
@@ -1481,6 +1563,20 @@ static int proxy_protocol_sess_init(void) {
 
     } else {
       session.c->remote_name = pr_netaddr_get_ipstr(session.c->remote_addr);
+    }
+
+    if (local_addr != NULL) {
+      if (pr_table_add_dup(session.notes, PROXY_PROTOCOL_LOCAL_ADDRESS_NOTE_NAME, pr_netaddr_get_ipstr(local_addr), 0) < 0) {
+        pr_log_debug(DEBUG0, MOD_PROXY_PROTOCOL_VERSION
+                     ": error adding %s session note: %s", PROXY_PROTOCOL_LOCAL_ADDRESS_NOTE_NAME, strerror(errno));
+      }
+
+      char port_string[6] = "";
+      pr_snprintf(port_string, sizeof(port_string), "%lu", (unsigned long) local_port);
+      if (pr_table_add_dup(session.notes, PROXY_PROTOCOL_LOCAL_PORT_NOTE_NAME, port_string, 0) < 0) {
+        pr_log_debug(DEBUG0, MOD_PROXY_PROTOCOL_VERSION
+                    ": error adding %s session note: %s", PROXY_PROTOCOL_LOCAL_PORT_NOTE_NAME, strerror(errno));
+      }
     }
 
     pr_netaddr_set_sess_addrs();
