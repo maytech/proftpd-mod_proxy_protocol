@@ -1,6 +1,6 @@
 /*
  * ProFTPD - mod_proxy_protocol
- * Copyright (c) 2013-2017 TJ Saunders
+ * Copyright (c) 2013-2021 TJ Saunders
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -30,12 +30,15 @@
 # include <sys/uio.h>
 #endif /* HAVE_SYS_UIO_H */
 
-#define MOD_PROXY_PROTOCOL_VERSION	"mod_proxy_protocol/0.2"
+#define MOD_PROXY_PROTOCOL_VERSION	"mod_proxy_protocol/0.5"
 
 /* Make sure the version of proftpd is as necessary. */
-#if PROFTPD_VERSION_NUMBER < 0x0001030504
-# error "ProFTPD 1.3.5rc4 or later required"
+#if PROFTPD_VERSION_NUMBER < 0x0001030507
+# error "ProFTPD 1.3.5a or later required"
 #endif
+
+/* From response.c.  XXX Need to provide these symbols another way. */
+extern pr_response_t *resp_list;
 
 module proxy_protocol_module;
 
@@ -49,6 +52,11 @@ static int proxy_protocol_timeout = PROXY_PROTOCOL_TIMEOUT_DEFAULT;
 static unsigned int proxy_protocol_version = PROXY_PROTOCOL_VERSION_HAPROXY_V1;
 static int proxy_protocol_engine = FALSE;
 static int proxy_protocol_local_address = FALSE;
+
+/* mod_proxy_protocol option flags */
+#define PROXY_PROTOCOL_OPT_USE_PROXIED_SERVER_ADDR	0x0001
+
+static unsigned long proxy_protocol_opts = 0UL;
 
 static const char *trace_channel = "proxy_protocol";
 
@@ -183,7 +191,7 @@ static int read_sock(int sockfd, void *buf, size_t reqlen) {
 
     session.total_raw_in += reqlen;
 
-    if (res == remainlen) {
+    if ((size_t) res == remainlen) {
       break;
     }
 
@@ -293,8 +301,8 @@ static unsigned int strtou(const char **str, const char *last) {
   return i;
 }
 
-/* This function waits a PROXY protocol header at the beginning of the
- * raw data stream. The header looks like this :
+/* This function waits for a PROXY protocol header at the beginning of the
+ * raw data stream. The header looks like this:
  *
  *   "PROXY" <sp> PROTO <sp> SRC3 <sp> DST3 <sp> SRC4 <sp> <DST4> "\r\n"
  *
@@ -303,12 +311,12 @@ static unsigned int strtou(const char **str, const char *last) {
  *  - PROTO: layer 4 protocol, which must be "TCP4" or "TCP6".
  *  - SRC3:  layer 3 (e.g. IP) source address in standard text form
  *  - DST3:  layer 3 (e.g. IP) destination address in standard text form
- *  - SRC4:  layer 4 (e.g. TCP port) source address in standard text form
- *  - DST4:  layer 4 (e.g. TCP port) destination address in standard text form
+ *  - SRC4:  layer 4 (e.g. TCP port) source port in standard text form
+ *  - DST4:  layer 4 (e.g. TCP port) destination port in standard text form
  */
 static int read_haproxy_v1(pool *p, conn_t *conn,
-    const pr_netaddr_t **proxied_addr, unsigned int *proxied_port,
-    const pr_netaddr_t **local_addr, unsigned int *local_port) {
+    const pr_netaddr_t **proxied_src_addr, unsigned int *proxied_src_port,
+    const pr_netaddr_t **proxied_dst_addr, unsigned int *proxied_dst_port) {
   register unsigned int i;
   char buf[PROXY_PROTOCOL_BUFSZ], *last = NULL, *ptr = NULL;
   int have_cr = FALSE, have_nl = FALSE, have_tcp4 = FALSE, have_tcp6 = FALSE;
@@ -408,7 +416,20 @@ static int read_haproxy_v1(pool *p, conn_t *conn,
 #endif /* PR_USE_IPV6 */
   }
 
-  if (have_tcp4 || have_tcp6) {
+  if (have_tcp4 == FALSE &&
+      have_tcp6 == FALSE) {
+    if (strncmp(ptr, "UNKNOWN", 7) == 0) {
+      pr_log_debug(DEBUG5, MOD_PROXY_PROTOCOL_VERSION
+        ": client cannot provide proxied address: '%.100s'", buf);
+      errno = ENOENT;
+      return 0;
+    }
+
+    pr_log_debug(DEBUG5, MOD_PROXY_PROTOCOL_VERSION
+      ": unknown/unsupported PROTO field");
+    goto bad_proto;
+
+  } else {
     const pr_netaddr_t *src_addr = NULL, *dst_addr = NULL;
     char *ptr2 = NULL;
     unsigned int src_port, dst_port;
@@ -474,7 +495,7 @@ static int read_haproxy_v1(pool *p, conn_t *conn,
      * hex.
      */
 
-    if (have_tcp4) {
+    if (have_tcp4 == TRUE) {
       if (pr_netaddr_get_family(src_addr) != AF_INET) {
         pr_log_debug(DEBUG8, MOD_PROXY_PROTOCOL_VERSION
           ": expected IPv4 source address for '%s', got IPv6",
@@ -591,11 +612,11 @@ static int read_haproxy_v1(pool *p, conn_t *conn,
     /* Set the source port for the source address. */
     pr_netaddr_set_port((pr_netaddr_t *) src_addr, htons(src_port));
 
-    *proxied_addr = src_addr;
-    *proxied_port = src_port;
+    *proxied_src_addr = src_addr;
+    *proxied_src_port = src_port;
 
-    *local_addr = dst_addr;
-    *local_port = dst_port;
+    *proxied_dst_addr = dst_addr;
+    *proxied_dst_port = dst_port;
 
   } else if (strncmp(ptr, "UNKNOWN", 7) == 0) {
     pr_log_debug(DEBUG5, MOD_PROXY_PROTOCOL_VERSION
@@ -620,11 +641,266 @@ bad_proto:
   return -1;
 }
 
+static void add_tlv_session_note(const char *key, const char *tlv_val,
+    size_t tlv_valsz) {
+  void *val;
+  size_t valsz;
+
+  /* TLVs are NOT null-terminated strings, but we want to store their
+   * session notes as such.
+   */
+  valsz = tlv_valsz + 1;
+  val = pr_table_pcalloc(session.notes, valsz);
+  memcpy(val, tlv_val, tlv_valsz);
+
+  pr_trace_msg(trace_channel, 17,
+    "adding session note: %s = %s", key, val);
+  (void) pr_table_add(session.notes, key, val, valsz);
+}
+
 static const char haproxy_v2_sig[12] = "\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A";
 
+/* The TLS TLV is convoluted enough to warrant its own special function. */
+static int read_haproxy_v2_tls_tlv(pool *p, void *tlv_val, size_t tlv_valsz) {
+  uint8_t client;
+  uint32_t verify;
+  unsigned char *ptr;
+  size_t len;
+
+  ptr = tlv_val;
+  len = tlv_valsz;
+
+  memcpy(&client, ptr, sizeof(client));
+  ptr += sizeof(client);
+  len -= sizeof(client);
+
+  memcpy(&verify, ptr, sizeof(verify));
+  ptr += sizeof(verify);
+  len -= sizeof(verify);
+  verify = ntohl(verify);
+
+  if (client > 0) {
+    /* CLIENT_CERT_CONN */
+    if (client & 0x02) {
+      pr_trace_msg(trace_channel, 19,
+        "TLS TLV: client provided certificate over current connection");
+
+    /* CLIENT_CERT_SESS */
+    } else if (client & 0x04) {
+      pr_trace_msg(trace_channel, 19,
+        "TLS TLV: client provided certificate over current TLS session");
+
+    } else {
+      pr_trace_msg(trace_channel, 19, "TLS TLV: client connected using TLS");
+    }
+
+  } else {
+    pr_trace_msg(trace_channel, 19,
+      "TLS TLV: client did not connect using TLS");
+  }
+
+  if (verify == 0) {
+    pr_trace_msg(trace_channel, 19,
+      "TLS TLV: client provided verified certificate");
+
+  } else {
+    pr_trace_msg(trace_channel, 19,
+      "TLS TLV: client did not provide verified certificate");
+  }
+
+  while (len > 0) {
+    uint8_t tls_type;
+    uint16_t tls_len;
+    void *tls_val;
+    size_t tls_valsz;
+
+    pr_signals_handle();
+
+    memcpy(&tls_type, ptr, sizeof(tls_type));
+    ptr += sizeof(tls_type);
+    len -= sizeof(tls_type);
+
+    memcpy(&tls_len, ptr, sizeof(tls_len));
+    ptr += sizeof(tls_len);
+    len -= sizeof(tls_len);
+
+    tls_valsz = ntohs(tls_len);
+    tls_val = ptr;
+    len -= tls_valsz;
+
+    switch (tls_type) {
+      /* TLS version */
+      case 0x21:
+        pr_trace_msg(trace_channel, 19,
+          "TLS TLV: TLS version: %.*s", (int) tls_valsz, (char *) tls_val);
+        add_tlv_session_note("mod_proxy_protocol.tls.version", tls_val,
+          tls_valsz);
+        break;
+
+      /* TLS CN */
+      case 0x22:
+        pr_trace_msg(trace_channel, 19,
+          "TLS TLV: TLS CN: %*.s", (int) tls_valsz, (char *) tls_val);
+        add_tlv_session_note("mod_proxy_protocol.tls.common-name", tls_val,
+          tls_valsz);
+        break;
+
+      /* TLS cipher */
+      case 0x23:
+        pr_trace_msg(trace_channel, 19,
+          "TLS TLV: TLS cipher: %.*s", (int) tls_valsz, (char *) tls_val);
+        add_tlv_session_note("mod_proxy_protocol.tls.cipher", tls_val,
+          tls_valsz);
+        break;
+
+      /* TLS signature algorithm */
+      case 0x24:
+        pr_trace_msg(trace_channel, 19,
+          "TLS TLV: TLS signature algorithm: %.*s", (int) tls_valsz,
+          (char *) tls_val);
+        add_tlv_session_note("mod_proxy_protocol.tls.signature-algo", tls_val,
+          tls_valsz);
+        break;
+
+      /* TLS key algorithm */
+      case 0x25:
+        pr_trace_msg(trace_channel, 19,
+          "TLS TLV: TLS key algorithm: %.*s", (int) tls_valsz,
+          (char *) tls_val);
+        add_tlv_session_note("mod_proxy_protocol.tls.key-algo", tls_val,
+          tls_valsz);
+        break;
+
+      default:
+        pr_trace_msg(trace_channel, 3,
+          "unsupported TLS TLV: %0x", tls_type);
+    }
+
+    /* Don't forget to advance ptr, for any more encapsulated TLVs. */
+    ptr += tls_valsz;
+  }
+
+  return 0;
+}
+
+static int read_haproxy_v2_tlvs(pool *p, conn_t *conn, size_t len) {
+  while (len > 0) {
+    int res;
+    uint8_t tlv_type;
+    uint16_t tlv_len;
+    size_t tlv_valsz;
+    void *tlv_val;
+    struct iovec tlv_hdr[2];
+
+    pr_signals_handle();
+
+    tlv_hdr[0].iov_base = (void *) &tlv_type;
+    tlv_hdr[0].iov_len = sizeof(tlv_type);
+    tlv_hdr[1].iov_base = (void *) &tlv_len;
+    tlv_hdr[1].iov_len = sizeof(tlv_len);
+
+    res = readv_sock(conn->rfd, tlv_hdr, 2);
+    if (res < 0) {
+      return -1;
+    }
+
+    if (res != 3) {
+      pr_trace_msg(trace_channel, 20, "read %lu TLV bytes, expected %lu bytes",
+        (unsigned long) res, (unsigned long) 3);
+      errno = EPERM;
+      return -1;
+    }
+
+    len -= res;
+
+    tlv_valsz = ntohs(tlv_len);
+    tlv_val = palloc(p, tlv_valsz);
+
+    /* TODO: Handle short reads, interrupted reads better? */
+    res = read(conn->rfd, tlv_val, tlv_valsz);
+    if (res < 0) {
+      return -1;
+    }
+
+    if ((size_t) res != tlv_valsz) {
+      pr_trace_msg(trace_channel, 20, "read %lu TLV bytes, expected %lu bytes",
+        (unsigned long) res, (unsigned long) tlv_valsz);
+      errno = EPERM;
+      return -1;
+    }
+
+    len -= res;
+
+    switch (tlv_type) {
+      /* ALPN */
+      case 0x01:
+        pr_trace_msg(trace_channel, 19,
+          "received proxy protocol V2 ALPN: %.*s", (int) tlv_valsz,
+          (char *) tlv_val);
+        add_tlv_session_note("mod_proxy_protocol.alpn", tlv_val, tlv_valsz);
+        break;
+
+      /* "Authority" (server name, ala SNI) */
+      case 0x02:
+        pr_trace_msg(trace_channel, 19,
+          "received proxy protocol V2 Authority (SNI): %.*s", (int) tlv_valsz,
+          (char *) tlv_val);
+        add_tlv_session_note("mod_proxy_protocol.authority", tlv_val,
+          tlv_valsz);
+        break;
+
+      /* CRC32 */
+      case 0x03:
+        pr_trace_msg(trace_channel, 19,
+          "received proxy protocol V2 CRC32 TLV (%lu bytes)",
+          (unsigned long) tlv_valsz);
+        break;
+
+      /* NOOP */
+      case 0x04:
+        pr_trace_msg(trace_channel, 19,
+          "received proxy protocol V2 NOOP TLV (%lu bytes)",
+          (unsigned long) tlv_valsz);
+        break;
+
+      /* Unique ID */
+      case 0x05:
+        pr_trace_msg(trace_channel, 19,
+          "received proxy protocol V2 Unique ID TLV (%lu bytes)",
+          (unsigned long) tlv_valsz);
+        add_tlv_session_note("mod_proxy_protocol.unique-id", tlv_val,
+          tlv_valsz);
+        break;
+
+      /* TLS */
+      case 0x20:
+        pr_trace_msg(trace_channel, 19,
+          "received proxy protocol V2 TLS TLV (%lu bytes)",
+          (unsigned long) tlv_valsz);
+        if (read_haproxy_v2_tls_tlv(p, tlv_val, tlv_valsz) < 0) {
+          return -1;
+        }
+        break;
+
+      /* Network namespace */
+      case 0x30:
+        pr_trace_msg(trace_channel, 19,
+          "received proxy protocol V2 Network Namespace: %.*s",
+          (int) tlv_valsz, (char *) tlv_val);
+        break;
+
+      default:
+        pr_trace_msg(trace_channel, 3,
+          "unsupported proxy protocol TLV: %0x", tlv_type);
+    }
+  }
+
+  return 0;
+}
+
 static int read_haproxy_v2(pool *p, conn_t *conn,
-    const pr_netaddr_t **proxied_addr, unsigned int *proxied_port,
-    const pr_netaddr_t **local_addr, unsigned int *local_port) {
+    const pr_netaddr_t **proxied_src_addr, unsigned int *proxied_src_port,
+    const pr_netaddr_t **proxied_dst_addr, unsigned int *proxied_dst_port) {
   int res = 0;
   uint8_t v2_sig[12], ver_cmd, trans_fam;
   uint16_t v2_len;
@@ -661,6 +937,9 @@ static int read_haproxy_v2(pool *p, conn_t *conn,
   }
 
   if ((ver_cmd & 0xF0) != 0x20) {
+    pr_trace_msg(trace_channel, 3,
+      "PROXY V2 version/command value (%0x) did not match expected protocol "
+      "version (0x20)", ver_cmd);
     errno = EINVAL;
     return -1;
   }
@@ -675,18 +954,18 @@ static int read_haproxy_v2(pool *p, conn_t *conn,
           uint16_t src_port, dst_port;
           struct iovec ipv4[4];
           struct sockaddr_in *saddr;
+          size_t tlv_len = 0;
 
           pr_trace_msg(trace_channel, 17,
             "received proxy protocol V2 TCP/IPv4 transport family (%lu bytes)",
             (unsigned long) ntohs(v2_len));
 
-          if (ntohs(v2_len) != 12) {
+          if (ntohs(v2_len) > 12) {
+            /* The addresses are followed by TLVs. */
+            tlv_len = ntohs(v2_len) - 12;
             pr_trace_msg(trace_channel, 3,
-              "proxy protocol V2 TCP/IPv4 transport family sent %lu bytes, "
-              "expected %lu bytes", (unsigned long) ntohs(v2_len),
-              (unsigned long) 12);
-            errno = EINVAL;
-            return -1;
+              "proxy protocol V2 TCP/IPv4 transport family received %lu bytes "
+              "of TLV data", (unsigned long) tlv_len);
           }
 
           ipv4[0].iov_base = (void *) &src_ipv4;
@@ -701,6 +980,12 @@ static int read_haproxy_v2(pool *p, conn_t *conn,
           res = readv_sock(conn->rfd, ipv4, 4);
           if (res < 0) {
             return -1;
+          }
+
+          if (tlv_len > 0) {
+            if (read_haproxy_v2_tlvs(p, conn, tlv_len) < 0) {
+              return -1;
+            }
           }
 
           src_addr = pr_netaddr_alloc(p);
@@ -722,10 +1007,8 @@ static int read_haproxy_v2(pool *p, conn_t *conn,
           pr_trace_msg(trace_channel, 17,
             "received proxy protocol V2 TCP/IPv4 transport family: "
             "source address %s#%d, destination address %s#%d",
-            pr_netaddr_get_ipstr(src_addr),
-            ntohs(pr_netaddr_get_port(src_addr)),
-            pr_netaddr_get_ipstr(dst_addr),
-            ntohs(pr_netaddr_get_port(dst_addr)));
+            pr_netaddr_get_ipstr(src_addr), ntohs(src_port),
+            pr_netaddr_get_ipstr(dst_addr), ntohs(dst_port));
 
           break;
         }
@@ -736,18 +1019,18 @@ static int read_haproxy_v2(pool *p, conn_t *conn,
           uint16_t src_port, dst_port;
           struct iovec ipv6[4];
           struct sockaddr_in6 *saddr;
+          size_t tlv_len = 0;
 
           pr_trace_msg(trace_channel, 17,
             "received proxy protocol V2 TCP/IPv6 transport family (%lu bytes)",
             (unsigned long) ntohs(v2_len));
 
-          if (ntohs(v2_len) != 36) {
+          if (ntohs(v2_len) > 36) {
+            /* The addresses are followed by TLVs. */
+            tlv_len = ntohs(v2_len) - 36;
             pr_trace_msg(trace_channel, 3,
-              "proxy protocol V2 TCP/IPv6 transport family sent %lu bytes, "
-              "expected %lu bytes", (unsigned long) ntohs(v2_len),
-              (unsigned long) 36);
-            errno = EINVAL;
-            return -1;
+              "proxy protocol V2 TCP/IPv4 transport family received %lu bytes "
+              "of TLV data", (unsigned long) tlv_len);
           }
 
 #ifdef PR_USE_IPV6
@@ -763,6 +1046,12 @@ static int read_haproxy_v2(pool *p, conn_t *conn,
           res = readv_sock(conn->rfd, ipv6, 4);
           if (res < 0) {
             return -1;
+          }
+
+          if (tlv_len > 0) {
+            if (read_haproxy_v2_tlvs(p, conn, tlv_len) < 0) {
+              return -1;
+            }
           }
 
           src_addr = pr_netaddr_alloc(p);
@@ -793,10 +1082,8 @@ static int read_haproxy_v2(pool *p, conn_t *conn,
           pr_trace_msg(trace_channel, 17,
             "received proxy protocol V2 TCP/IPv6 transport family: "
             "source address %s#%d, destination address %s#%d",
-            pr_netaddr_get_ipstr(src_addr),
-            ntohs(pr_netaddr_get_port(src_addr)),
-            pr_netaddr_get_ipstr(dst_addr),
-            ntohs(pr_netaddr_get_port(dst_addr)));
+            pr_netaddr_get_ipstr(src_addr), ntohs(src_port),
+            pr_netaddr_get_ipstr(dst_addr), ntohs(dst_port));
 #else
           /* Avoid compiler warnings about unused variables. */
           (void) src_ipv6;
@@ -892,14 +1179,6 @@ static int read_haproxy_v2(pool *p, conn_t *conn,
     return 0;
   }
 
-  if (ntohs(pr_netaddr_get_port(dst_addr)) > 65535) {
-    pr_log_debug(DEBUG0, MOD_PROXY_PROTOCOL_VERSION
-      ": out-of-range destination port provided: %u",
-      ntohs(pr_netaddr_get_port(dst_addr)));
-    errno = EINVAL;
-    return -1;
-  }
-
   /* Paranoidly check the given source address/port against the
    * destination address/port.  If the two tuples match, then the remote
    * client is lying to us (it's not possible to have a TCP connection
@@ -915,8 +1194,11 @@ static int read_haproxy_v2(pool *p, conn_t *conn,
     return -1;
   }
 
-  *proxied_addr = src_addr;
-  *proxied_port = ntohs(pr_netaddr_get_port(src_addr));
+  *proxied_src_addr = src_addr;
+  *proxied_src_port = ntohs(pr_netaddr_get_port(src_addr));
+
+  *proxied_dst_addr = dst_addr;
+  *proxied_dst_port = ntohs(pr_netaddr_get_port(dst_addr));
 
   *local_addr = dst_addr;
   *local_port = ntohs(pr_netaddr_get_port(dst_addr));
@@ -924,20 +1206,24 @@ static int read_haproxy_v2(pool *p, conn_t *conn,
   return 0;
 }
 
-static int read_proxied_addr(pool *p, conn_t *conn,
-   const pr_netaddr_t **proxied_addr, unsigned int *proxied_port,
-   const pr_netaddr_t **local_addr, unsigned int *local_port) {
+static int read_proxied_addrs(pool *p, conn_t *conn,
+   const pr_netaddr_t **proxied_src_addr, unsigned int *proxied_src_port,
+   const pr_netaddr_t **proxied_dst_addr, unsigned int *proxied_dst_port) {
   int res;
 
   /* Note that in theory, we could auto-detect the protocol version. */
 
   switch (proxy_protocol_version) {
     case PROXY_PROTOCOL_VERSION_HAPROXY_V1:
-      res = read_haproxy_v1(p, conn, proxied_addr, proxied_port, local_addr, local_port);
+      pr_trace_msg(trace_channel, 19, "reading PROXY V1 message");
+      res = read_haproxy_v1(p, conn, proxied_src_addr, proxied_src_port,
+        proxied_dst_addr, proxied_dst_port);
       break;
 
     case PROXY_PROTOCOL_VERSION_HAPROXY_V2:
-      res = read_haproxy_v2(p, conn, proxied_addr, proxied_port, local_addr, local_port);
+      pr_trace_msg(trace_channel, 19, "reading PROXY V2 message");
+      res = read_haproxy_v2(p, conn, proxied_src_addr, proxied_src_port,
+        proxied_dst_addr, proxied_dst_port);
       break;
 
     default:
@@ -983,6 +1269,36 @@ MODRET set_proxyprotocolengine(cmd_rec *cmd) {
   if (check_context(cmd, CONF_ROOT)) {
       proxy_protocol_engine = engine;
   }
+
+  return PR_HANDLED(cmd);
+}
+
+/* usage: ProxyProtocolOptions opt1 ... */
+MODRET set_proxyprotocoloptions(cmd_rec *cmd) {
+  register unsigned int i;
+  unsigned long opts = 0UL;
+  config_rec *c = NULL;
+
+  if (cmd->argc-1 == 0) {
+    CONF_ERROR(cmd, "wrong number of parameters");
+  }
+
+  CHECK_CONF(cmd, CONF_ROOT|CONF_VIRTUAL|CONF_GLOBAL);
+
+  c = add_config_param(cmd->argv[0], 1, NULL);
+
+  for (i = 1; i < cmd->argc; i++) {
+    if (strcmp(cmd->argv[i], "UseProxiedServerAddress") == 0) {
+      opts |= PROXY_PROTOCOL_OPT_USE_PROXIED_SERVER_ADDR;
+
+    } else {
+      CONF_ERROR(cmd, pstrcat(cmd->tmp_pool, ": unknown ProxyProtocolOption '",
+        cmd->argv[i], "'", NULL));
+    }
+  }
+
+  c->argv[0] = pcalloc(c->pool, sizeof(unsigned long));
+  *((unsigned long *) c->argv[0]) = opts;
 
   return PR_HANDLED(cmd);
 }
@@ -1166,9 +1482,9 @@ static int proxy_protocol_init(void) {
 static int proxy_protocol_sess_init(void) {
   config_rec *c;
   int engine = 0, res = 0, timerno = -1, xerrno;
-  const pr_netaddr_t *proxied_addr = NULL, *local_addr = NULL;
-  unsigned int proxied_port = 0, local_port = 0;
-  const char *remote_ip = NULL, *remote_name = NULL, *local_ip = NULL;
+  const pr_netaddr_t *proxied_src_addr = NULL, *proxied_dst_addr = NULL;
+  unsigned int proxied_src_port = 0, proxied_dst_port = 0;
+  const char *remote_ip = NULL, *remote_name = NULL;
   pr_netio_t *tls_netio = NULL;
 
   if (proxy_protocol_local_address == TRUE) {
@@ -1182,6 +1498,19 @@ static int proxy_protocol_sess_init(void) {
 
   if (engine == FALSE) {
     return 0;
+  }
+
+  /* ProxyProtocolOptions */
+  c = find_config(main_server->conf, CONF_PARAM, "ProxyProtocolOptions", FALSE);
+  while (c != NULL) {
+    unsigned long opts = 0;
+
+    pr_signals_handle();
+
+    opts = *((unsigned long *) c->argv[0]);
+    proxy_protocol_opts |= opts;
+
+    c = find_config_next(c, c->next, CONF_PARAM, "ProxyProtocolOptions", FALSE);
   }
 
   c = find_config(main_server->conf, CONF_PARAM, "ProxyProtocolTimeout", FALSE);
@@ -1201,7 +1530,7 @@ static int proxy_protocol_sess_init(void) {
   }
 
   /* If the mod_tls module is in effect, then we need to work around its
-   * use of the NetIO API.  Otherwise, trying to read the proxied address
+   * use of the NetIO API.  Otherwise, trying to read the proxied addresses
    * on the control connection will cause problems, e.g. for FTPS clients
    * using implicit TLS.
    */
@@ -1214,12 +1543,12 @@ static int proxy_protocol_sess_init(void) {
     tls_netio = NULL;
 
   } else {
-    /* Unregister it; we'll put it back after reading the proxied address. */
+    /* Unregister it; we'll put it back after reading the proxied addresses. */
     pr_unregister_netio(PR_NETIO_STRM_CTRL);
   }
 
-  res = read_proxied_addr(session.pool, session.c, &proxied_addr,
-    &proxied_port, &local_addr, &local_port);
+  res = read_proxied_addrs(session.pool, session.c, &proxied_src_addr,
+    &proxied_src_port, &proxied_dst_addr, &proxied_dst_port);
   xerrno = errno;
 
   if (tls_netio != NULL) {
@@ -1241,17 +1570,18 @@ static int proxy_protocol_sess_init(void) {
     return -1;
   }
 
-  if (proxied_addr != NULL) {
+  if (proxied_src_addr != NULL) {
     remote_ip = pstrdup(session.pool,
       pr_netaddr_get_ipstr(pr_netaddr_get_sess_remote_addr()));
     remote_name = pstrdup(session.pool,
       pr_netaddr_get_sess_remote_name());
 
     pr_log_debug(DEBUG9, MOD_PROXY_PROTOCOL_VERSION
-      ": using proxied source address: %s", pr_netaddr_get_ipstr(proxied_addr));
+      ": using proxied source address: %s",
+      pr_netaddr_get_ipstr(proxied_src_addr));
 
-    session.c->remote_addr = proxied_addr;
-    session.c->remote_port = proxied_port;
+    session.c->remote_addr = proxied_src_addr;
+    session.c->remote_port = proxied_src_port;
 
     /* Now perform reverse DNS lookups. */
     if (ServerUseReverseDNS) {
@@ -1266,12 +1596,78 @@ static int proxy_protocol_sess_init(void) {
       session.c->remote_name = pr_netaddr_get_ipstr(session.c->remote_addr);
     }
 
-    pr_netaddr_set_sess_addrs();
-
     pr_log_debug(DEBUG0, MOD_PROXY_PROTOCOL_VERSION
       ": UPDATED client remote address/name: %s/%s (WAS %s/%s)",
       pr_netaddr_get_ipstr(pr_netaddr_get_sess_remote_addr()),
       pr_netaddr_get_sess_remote_name(), remote_ip, remote_name);
+
+    if (proxy_protocol_opts & PROXY_PROTOCOL_OPT_USE_PROXIED_SERVER_ADDR) {
+      server_rec *proxied_server = NULL;
+
+      /* Add "mod_proxy_protocol.proxied_server_addr" session note.  With, or
+       *   without, port?
+       */
+
+      if (pr_netaddr_cmp(session.c->local_addr, proxied_dst_addr) != 0 ||
+          session.c->local_port != proxied_dst_port) {
+
+        /* Notify any listeners (e.g. mod_autohost) of the proxied address, to
+         * give them a chance to update/modify the configuration.
+         */
+        pr_event_generate("mod_proxy_protocol.proxied-server-address",
+          proxied_dst_addr);
+
+        proxied_server = pr_ipbind_get_server(proxied_dst_addr,
+          proxied_dst_port);
+      }
+
+      if (proxied_server != NULL &&
+          proxied_server != main_server) {
+        pool *tmp_pool = NULL;
+        cmd_rec *host_cmd = NULL;
+
+        pr_log_debug(DEBUG0,
+          "Changing to server '%s' (%s:%d) due to PROXY protocol",
+          proxied_server->ServerName, pr_netaddr_get_ipstr(proxied_dst_addr),
+          proxied_dst_port);
+
+        pr_log_debug(DEBUG0, MOD_PROXY_PROTOCOL_VERSION
+          ": UPDATED local server address/port: %s:%d (WAS %s:%d)",
+          pr_netaddr_get_ipstr(pr_netaddr_get_sess_local_addr()),
+          session.c->local_port, pr_netaddr_get_ipstr(proxied_dst_addr),
+          proxied_dst_port);
+
+        session.c->local_addr = proxied_dst_addr;
+        session.c->local_port = proxied_dst_port;
+
+        /* Set a session flag indicating that the main_server pointer
+         * changed.
+         */
+        session.prev_server = main_server;
+        main_server = proxied_server;
+
+        pr_event_generate("core.session-reinit", proxied_server);
+
+        /* Now we need to inform the modules of the changed config, to let them
+         * do their checks.
+         */
+        tmp_pool = make_sub_pool(session.pool);
+        pr_pool_tag(tmp_pool, "ProxyProtocol UseProxiedServerAddress pool");
+
+        host_cmd = pr_cmd_alloc(tmp_pool, 2, pstrdup(tmp_pool, C_HOST),
+          pstrdup(tmp_pool, pr_netaddr_get_ipstr(proxied_dst_addr)), NULL);
+        pr_cmd_dispatch_phase(host_cmd, POST_CMD, 0);
+        pr_cmd_dispatch_phase(host_cmd, LOG_CMD, 0);
+        pr_response_clear(&resp_list);
+
+        destroy_pool(tmp_pool);
+      }
+    }
+
+    /* Note that we set the session addresses (remote and local) only after
+     * possible processing of the proxied destination address.
+     */
+    pr_netaddr_set_sess_addrs();
 
     /* Find the new class for this session. */
     session.conn_class = pr_class_match_addr(session.c->remote_addr);
@@ -1294,6 +1690,7 @@ static int proxy_protocol_sess_init(void) {
 
 static conftable proxy_protocol_conftab[] = {
   { "ProxyProtocolEngine",	set_proxyprotocolengine,	NULL },
+  { "ProxyProtocolOptions",	set_proxyprotocoloptions,	NULL },
   { "ProxyProtocolTimeout",	set_proxyprotocoltimeout,	NULL },
   { "ProxyProtocolVersion",	set_proxyprotocolversion,	NULL },
   { "ProxyProtocolLocalAddress",	set_proxyprotocollocaladdress,	NULL },
